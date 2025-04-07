@@ -18,8 +18,6 @@ api_id = '23415626'
 api_hash = '84407a767ffbbd9ce175bb9dba5948f2'
 
 channel_pairs = [
-    ('@crypto_sekta', -1002188335470),
-    ('@trade001k', -1002188335470),
     ('@kripota4', -1002188335470),
     ('@cryptogram_web3', -1002188335470),
 ]
