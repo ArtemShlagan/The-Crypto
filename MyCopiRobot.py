@@ -3,11 +3,11 @@ import asyncio
 import logging
 import re
 from telethon import TelegramClient
-from telethon.tl.types import MessageEntityUrl
 from telethon.tl.types import (
+    MessageEntityUrl,
+    MessageEntityTextUrl,
     MessageMediaPhoto,
-    MessageMediaDocument,
-    MessageEntityTextUrl
+    MessageMediaDocument
 )
 from telethon.errors import SessionPasswordNeededError
 
@@ -31,74 +31,120 @@ client = TelegramClient(session_path, api_id, api_hash)
 sent_messages = {}
 
 def remove_all_link_lines(message):
+    """
+    Проверяем, нужно ли удалять какие-то строки (есть ли ссылки на t.me или инлайн-ссылки).
+    Если ничего удалять не нужно, вернём (original_text, False).
+    Если что-то удалили, вернём (modified_text, True).
+    
+    Обратите внимание, что если ссылок t.me и инлайн-ссылок нет, мы НЕ трогаем сообщение.
+    """
     text = message.raw_text or ""
     if not text:
-        return text
+        return text, False
 
     lines = text.split('\n')
-    
-    # Регулярка для пошуку будь-якого URL (http, https, www, t.me тощо)
-    link_pattern = re.compile(r'(https?://\S+|http?://\S+|www\.\S+|t\.me/\S+)', re.IGNORECASE)
-
     lines_to_remove = set()
-    removed_any = False  # прапорець для відслідковування видалення хоча б одного рядка
+    removed_any = False
 
-    # 1) Видаляємо рядки з inline-посиланнями (Telethon позначає їх як MessageEntityTextUrl або MessageEntityUrl)
+    # Шаблон для прямых ссылок на Telegram
+    telegram_link_pattern = re.compile(r'(?:https?://)?(?:www\.)?t\.me/\S+', re.IGNORECASE)
+
+    # 1) Проверяем inline-ссылки (MessageEntityTextUrl / MessageEntityUrl), удаляем строку,
+    #    только если это t.me.
     if message.entities:
         for entity in message.entities:
-            if isinstance(entity, (MessageEntityTextUrl, MessageEntityUrl)):
-                offset = entity.offset
-                total = 0
-                for i, line in enumerate(lines):
-                    line_length = len(line)
-                    if offset >= total and offset < total + line_length:
-                        lines_to_remove.add(i)
-                        removed_any = True
-                        break
-                    total += line_length + 1  # +1 для символу нового рядка
+            offset = entity.offset
+            total = 0
+            for i, line in enumerate(lines):
+                line_length = len(line)
+                if offset >= total and offset < total + line_length:
+                    # Если это цитата (начинается с '>'), не трогаем — как пример, вдруг захотите.
+                    # Но можно и удалять цитаты, если нужно.
+                    if not line.lstrip().startswith('>'):
+                        # Проверяем, действительно ли это t.me:
+                        if isinstance(entity, MessageEntityTextUrl):
+                            # Это всегда «кликабельная» ссылка, удаляем строку без разбора
+                            # или можно проверить URL из entity.url, если хотите.
+                            # Но обычно TextUrl = любая ссылка.
+                            # Если хотите удалять только t.me, тогда сравните entity.url
+                            # с регуляркой.
+                            pass
+                            # Чтобы удалять только t.me, раскомментируйте:
+                            # if re.search(telegram_link_pattern, entity.url):
+                            lines_to_remove.add(i)
+                            removed_any = True
 
-    # 2) Видаляємо рядки з прямих посилань
+                        elif isinstance(entity, MessageEntityUrl):
+                            url_text = text[entity.offset: entity.offset + entity.length]
+                            # Удаляем строку, только если t.me
+                            if re.search(telegram_link_pattern, url_text):
+                                lines_to_remove.add(i)
+                                removed_any = True
+                    break
+                total += line_length + 1
+
+    # 2) Проверяем прямые ссылки вида t.me/... (не как сущности, а просто текст).
     for i, line in enumerate(lines):
-        if re.search(link_pattern, line):
-            lines_to_remove.add(i)
-            removed_any = True
+        if i not in lines_to_remove:
+            # Если это цитата — решите сами, удалять или нет.
+            if not line.lstrip().startswith('>'):
+                if re.search(telegram_link_pattern, line):
+                    lines_to_remove.add(i)
+                    removed_any = True
 
-    # 3) Формуємо новий текст з "хороших" рядків
+    # Если ничего не удаляли, просто возвращаем исходный текст
+    if not removed_any:
+        return text, False
+
+    # Иначе убираем строки
     new_lines = [line for i, line in enumerate(lines) if i not in lines_to_remove]
     new_text = "\n".join(new_lines).strip()
-
-    # Якщо хоча б один рядок було видалено, додаємо інлайн-ссилку з HTML форматуванням
-    if removed_any:
-        inline_link = '<a href="https://t.me/+gOxTz-7iTuhlYThi">The Crypto Currency</a>'
-        if new_text:
-            new_text += "\n" + inline_link
-        else:
-            new_text = inline_link
-
-    return new_text
+    return new_text, True
 
 async def process_message(message, source_channel, target_channel):
+    # Не отправляем повторно одно и то же сообщение
     if message.id in sent_messages.get(target_channel, []):
         return
 
-    text = remove_all_link_lines(message)
+    # Сначала проверяем, нужно ли вообще что-то чистить
+    modified_text, removed_any = remove_all_link_lines(message)
 
-    media_files = []
-    if message.media:
-        if isinstance(message.media, MessageMediaPhoto):
-            media_files.append(message.photo)
-        elif isinstance(message.media, MessageMediaDocument):
-            media_files.append(message.document)
+    if not removed_any:
+        # Если никаких "вредных" ссылок нет, просто форвардим сообщение "как есть"
+        await client.forward_messages(
+            entity=target_channel,
+            messages=message.id,
+            from_peer=source_channel
+        )
+        logger.info(f"Сообщение {message.id} переслано (forward) без изменений в {target_channel}")
+    else:
+        # Если что-то удалили, отправляем заново (с уже очищенным текстом).
+        # По желанию добавляем свою ссылку, если хотим.
+        final_text = modified_text + "\n[The Crypto Currency](https://t.me/+gOxTz-7iTuhlYThi)"
 
-    try:
-        if media_files:
-            await client.send_file(target_channel, media_files[0], caption=text, parse_mode='html')
-        else:
-            await client.send_message(target_channel, text, parse_mode='html')
-        logger.info(f"Сообщення {message.id} відправлено в {target_channel}")
-        sent_messages.setdefault(target_channel, []).append(message.id)
-    except Exception as e:
-        logger.error(f"Помилка відправки повідомлення в {target_channel}: {e}")
+        # Проверяем, есть ли медиа
+        media_files = []
+        if message.media:
+            if isinstance(message.media, MessageMediaPhoto):
+                media_files.append(message.photo)
+            elif isinstance(message.media, MessageMediaDocument):
+                media_files.append(message.document)
+
+        try:
+            if media_files:
+                await client.send_file(target_channel, media_files[0],
+                                       caption=final_text,
+                                       parse_mode='markdown')
+            else:
+                await client.send_message(target_channel,
+                                          final_text,
+                                          parse_mode='markdown')
+            logger.info(f"Сообщение {message.id} отправлено с удалёнными ссылками в {target_channel}")
+        except Exception as e:
+            logger.error(f"Ошибка при отправке сообщения в {target_channel}: {e}")
+
+    # Помечаем, что сообщение уже обработано
+    sent_messages.setdefault(target_channel, []).append(message.id)
 
 async def main():
     try:
@@ -107,10 +153,10 @@ async def main():
         else:
             await client.start()
     except SessionPasswordNeededError:
-        logger.error("Необхідний пароль для входу в аккаунт")
+        logger.error("Необходим пароль для входа в аккаунт")
         return
     except Exception as e:
-        logger.error(f"Помилка аутентифікації: {e}")
+        logger.error(f"Ошибка аутентификации: {e}")
         return
 
     last_message_ids = {source: None for source, target in channel_pairs}
